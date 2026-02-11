@@ -13,9 +13,8 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
-from torchvision.datasets import DatasetFolder
 from torchvision import transforms
 import numpy as np
 from collections import OrderedDict
@@ -83,14 +82,6 @@ def create_logger(logging_dir):
     return logger
 
 
-def npy_loader(path):
-    """
-    Loader for .npy files.
-    extract_features.py saved them as numpy arrays.
-    We load them and convert to torch tensor.
-    """
-    return torch.from_numpy(np.load(path))
-
 class LatentFlip(object):
     """
     Randomly flip the latent feature horizontally.
@@ -105,6 +96,54 @@ class LatentFlip(object):
         if torch.rand(1) < self.p:
             return x.flip(-1)
         return x
+
+
+class NpyListDataset(Dataset):
+    """
+    Dataset that reads .npy file paths from a pre-generated filelist.
+    Avoids slow os.walk on Lustre/networked filesystems.
+    
+    Expected filelist format (one path per line):
+        /path/to/train/classA/file1.npy
+        /path/to/train/classA/file2.npy
+        /path/to/train/classB/file3.npy
+        ...
+    
+    Class labels are derived from the parent directory name (ImageNet-style).
+    """
+    def __init__(self, filelist_path, transform=None):
+        with open(filelist_path, 'r') as f:
+            self.samples = [line.strip() for line in f if line.strip()]
+        # Build class-to-index mapping from parent directory names
+        classes = sorted(set(os.path.basename(os.path.dirname(s)) for s in self.samples))
+        self.class_to_idx = {c: i for i, c in enumerate(classes)}
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path = self.samples[idx]
+        x = torch.from_numpy(np.load(path))
+        label = self.class_to_idx[os.path.basename(os.path.dirname(path))]
+        if self.transform:
+            x = self.transform(x)
+        return x, label
+
+
+def generate_filelist(features_path, filelist_path):
+    """
+    Walk features_path to find all .npy files and write their paths to filelist_path.
+    Only rank 0 should call this; other ranks wait via dist.barrier().
+    """
+    print(f"Generating filelist from {features_path} ...")
+    with open(filelist_path, 'w') as f:
+        for root, _, fnames in os.walk(features_path):
+            for fname in sorted(fnames):
+                if fname.endswith('.npy'):
+                    f.write(os.path.join(root, fname) + '\n')
+    print(f"Filelist saved to {filelist_path}")
+
     
 #################################################################################
 #                                  Training Loop                                #
@@ -162,10 +201,20 @@ def main(args):
     transform = transforms.Compose([
         LatentFlip(p=0.5)
     ])
-    dataset = DatasetFolder(
-        root=args.features_path, 
-        loader=npy_loader, 
-        extensions=('.npy',), 
+
+    # Auto-generate filelist if not provided
+    if args.filelist is None:
+        # Default filelist path next to the features directory
+        args.filelist = os.path.join(os.path.dirname(args.features_path.rstrip('/')), "filelist.txt")
+
+    # Generate filelist if it doesn't exist (only rank 0 writes, others wait)
+    if not os.path.exists(args.filelist):
+        if rank == 0:
+            generate_filelist(args.features_path, args.filelist)
+        dist.barrier()  # All ranks wait until filelist is ready
+
+    dataset = NpyListDataset(
+        filelist_path=args.filelist,
         transform=transform
     )
     sampler = DistributedSampler(
@@ -184,7 +233,7 @@ def main(args):
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} latent images ({args.features_path})")
+    logger.info(f"Dataset contains {len(dataset):,} latent images (filelist: {args.filelist})")
 
     # Calculate LR and Steps:
     # 1. Linear Scaling Rule: lr = base_lr * (global_batch_size / 256)
@@ -293,6 +342,10 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--features-path", type=str, required=True, help="Path to the directory containing .npy files")
+    parser.add_argument("--filelist", type=str, default=None,
+                        help="Path to a pre-generated filelist (.txt, one .npy path per line). "
+                             "If not provided, defaults to filelist.txt next to features-path. "
+                             "If the file does not exist, it will be auto-generated on first run.")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-B/2")
     parser.add_argument("--image-size", type=int, choices=[128, 256, 512], default=128)
@@ -308,4 +361,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     main(args)
 
-# torchrun --nnodes=1 --nproc_per_node=4 train_feat_bf16_cp_bz.py --model DiT-B/2 --features-path /work/c30778/dataset/dit_feat_fix/train
+# Usage:
+# 1. (Recommended) Pre-generate filelist for instant startup:
+#    find /lustre1/work/c30944/DATASET/imagenet_sqr2_lat/train -name "*.npy" > filelist.txt
+#    torchrun --nnodes=1 --nproc_per_node=4 train_feat_bf16_cp_bz.py --model DiT-B/2 --features-path /lustre1/work/c30944/DATASET/imagenet_sqr2_lat/train --filelist filelist.txt
+#
+# 2. Auto-generate filelist on first run (slow first time, fast afterwards):
+#    torchrun --nnodes=1 --nproc_per_node=4 train_feat_bf16_cp_bz.py --model DiT-B/2 --features-path /lustre1/work/c30944/DATASET/imagenet_sqr2_lat/train
