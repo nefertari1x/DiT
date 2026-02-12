@@ -1,2 +1,5 @@
 __pycache__/
 results/
+wandb/
+
+filelist.txt
