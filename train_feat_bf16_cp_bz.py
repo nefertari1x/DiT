@@ -405,7 +405,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=10_000)
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of epochs for learning rate warmup")
     # W&B arguments:
-    parser.add_argument("--wandb-project", type=str, default="dit-B/2-sqr2-ds2-seq4096", help="W&B project name")
+    parser.add_argument("--wandb-project", type=str, default="dit-B-2-sqr2-ds2-seq4096", help="W&B project name")
     parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user). None = default entity")
     parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name. Auto-generated if not set")
     parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
