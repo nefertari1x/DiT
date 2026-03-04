@@ -94,6 +94,26 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
+class DepthEmbedder(nn.Module):
+    """
+    Embeds per-token quadtree depth levels.
+    Each DiT token covers `leaves_per_token` z-order leaves; their depth values
+    are embedded individually and mean-pooled into a single vector per token.
+    """
+    def __init__(self, num_depth_levels, hidden_size, leaves_per_token=16):
+        super().__init__()
+        self.embedding = nn.Embedding(num_depth_levels, hidden_size)
+        self.leaves_per_token = leaves_per_token
+
+    def forward(self, depth):
+        """
+        depth: (N, T, leaves_per_token) integer tensor, values in [0, num_depth_levels)
+        returns: (N, T, D)
+        """
+        emb = self.embedding(depth)   # (N, T, leaves_per_token, D)
+        return emb.mean(dim=2)        # (N, T, D)
+
+
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
@@ -158,6 +178,8 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        num_depth_levels=0,
+        leaves_per_token=16,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -172,6 +194,10 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.use_depth = num_depth_levels > 0
+        if self.use_depth:
+            self.depth_embedder = DepthEmbedder(num_depth_levels, hidden_size, leaves_per_token)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
@@ -199,6 +225,10 @@ class DiT(nn.Module):
 
         # Initialize label embedding table:
         nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+
+        # Initialize depth embedding table (if used):
+        if self.use_depth:
+            nn.init.normal_(self.depth_embedder.embedding.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -230,14 +260,17 @@ class DiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, depth=None):
         """
         Forward pass of DiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
+        depth: (N, T, leaves_per_token) optional integer tensor of quadtree depth levels
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
+        if depth is not None and self.use_depth:
+            x = x + self.depth_embedder(depth)    # (N, T, D)
         t = self.t_embedder(t)                   # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
@@ -247,14 +280,17 @@ class DiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
-    def forward_with_cfg(self, x, t, y, cfg_scale):
+    def forward_with_cfg(self, x, t, y, cfg_scale, depth=None):
         """
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
-        model_out = self.forward(combined, t, y)
+        if depth is not None:
+            depth_half = depth[: len(depth) // 2]
+            depth = torch.cat([depth_half, depth_half], dim=0)
+        model_out = self.forward(combined, t, y, depth=depth)
         # For exact reproducibility reasons, we apply classifier-free guidance on only
         # three channels by default. The standard approach to cfg applies it to all channels.
         # This can be done by uncommenting the following line and commenting-out the line following that.
