@@ -29,11 +29,7 @@ from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
-try:
-    import wandb
-    WANDB_AVAILABLE = True
-except ImportError:
-    WANDB_AVAILABLE = False
+from torch.utils.tensorboard import SummaryWriter
 
 
 #################################################################################
@@ -241,18 +237,11 @@ def main(args):
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 4
 
-    # Initialize wandb (rank 0 only):
-    use_wandb = (rank == 0) and WANDB_AVAILABLE and (not args.no_wandb)
-    if use_wandb:
-        wandb_run_name = args.wandb_run_name or f"{args.model}_img{args.image_size}_bs{args.global_batch_size}"
-        wandb.init(
-            project=args.wandb_project,
-            entity=args.wandb_entity,
-            name=wandb_run_name,
-            config=vars(args),
-            dir=experiment_dir if rank == 0 else None,
-        )
-        logger.info(f"W&B run: {wandb.run.url}")
+    # Initialize TensorBoard (rank 0 only):
+    tb_writer = None
+    if rank == 0:
+        tb_writer = SummaryWriter(log_dir=f"{experiment_dir}/tensorboard")
+        logger.info(f"TensorBoard log dir: {experiment_dir}/tensorboard")
 
     model = DiT_models[args.model](
         input_size=latent_size,
@@ -391,19 +380,12 @@ def main(args):
                 current_lr = opt.param_groups[0]["lr"]
                 
                 logger.info(f"(Step={train_steps:07d}) Train Loss: {avg_loss:.4f}, GNorm: {grad_norm:.2f} , LR: {current_lr:.2e}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # W&B logging:
-                if use_wandb:
-                    wandb.log({
-                        "train/loss": avg_loss,
-                        "train/grad_norm": grad_norm.item() if torch.is_tensor(grad_norm) else grad_norm,
-                        "train/lr": current_lr,
-                        "train/steps_per_sec": steps_per_sec,
-                        "train/epoch": epoch + train_steps % steps_per_epoch / steps_per_epoch,
-                        "train/step": train_steps,
-                        "train/total_steps": total_steps,
-                        "train/progress_pct": train_steps / total_steps * 100,
-                        "train/samples_seen": train_steps * args.global_batch_size,
-                    }, step=train_steps)
+                # TensorBoard logging:
+                if tb_writer is not None:
+                    tb_writer.add_scalar("train/loss", avg_loss, train_steps)
+                    tb_writer.add_scalar("train/lr", current_lr, train_steps)
+                    tb_writer.add_scalar("train/epoch", epoch + train_steps % steps_per_epoch / steps_per_epoch, train_steps)
+                    tb_writer.add_scalar("train/steps_per_sec", steps_per_sec, train_steps)
                 # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
@@ -421,16 +403,14 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                    if use_wandb:
-                        wandb.log({"checkpoint/step": train_steps}, step=train_steps)
                 dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
     logger.info("Done!")
-    if use_wandb:
-        wandb.finish()
+    if tb_writer is not None:
+        tb_writer.close()
     cleanup()
 
 
@@ -459,11 +439,6 @@ if __name__ == "__main__":
                         help="Number of discrete depth levels (0 disables depth conditioning)")
     parser.add_argument("--leaves-per-token", type=int, default=16,
                         help="Number of z-order leaves per DiT token")
-    # W&B arguments:
-    parser.add_argument("--wandb-project", type=str, default="dit-B-2-sqr2-ds2-seq4096-qdt", help="W&B project name")
-    parser.add_argument("--wandb-entity", type=str, default=None, help="W&B entity (team/user). None = default entity")
-    parser.add_argument("--wandb-run-name", type=str, default=None, help="W&B run name. Auto-generated if not set")
-    parser.add_argument("--no-wandb", action="store_true", help="Disable W&B logging")
     args = parser.parse_args()
     main(args)
 
