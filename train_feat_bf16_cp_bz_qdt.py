@@ -137,10 +137,31 @@ class NpyDepthListDataset(Dataset):
     def __init__(self, filelist_path, gather_idx, flip_p=0.5,
                  default_depth=7, num_depth_levels=8):
         with open(filelist_path, 'r') as f:
-            self.samples = [
+            raw_samples = [
                 line.strip() for line in f
                 if line.strip() and not line.strip().endswith('_depth.npy')
             ]
+        # Validate samples: filter out entries with missing/bad depth files
+        expected_len = gather_idx.shape[0] * gather_idx.shape[1]
+        valid_samples = []
+        skipped = 0
+        for path in raw_samples:
+            depth_path = path.replace('.npy', '_depth.npy')
+            if not os.path.exists(depth_path):
+                skipped += 1
+                continue
+            try:
+                d = np.load(depth_path, mmap_mode='r')
+                if d.shape[0] != expected_len:
+                    skipped += 1
+                    continue
+            except Exception:
+                skipped += 1
+                continue
+            valid_samples.append(path)
+        if skipped > 0:
+            print(f"[NpyDepthListDataset] Skipped {skipped} samples with missing/bad depth files.")
+        self.samples = valid_samples
         classes = sorted(set(
             os.path.basename(os.path.dirname(s)) for s in self.samples
         ))
