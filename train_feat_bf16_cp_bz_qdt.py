@@ -28,6 +28,7 @@ import math  # Added for cosine calculation
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from download import resume_from_checkpoint
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -35,6 +36,17 @@ from torch.utils.tensorboard import SummaryWriter
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+def copy_tb_events(src_tb_dir, dst_writer, max_step):
+    """Copy TensorBoard scalar events from src_tb_dir to dst_writer, keeping only step <= max_step."""
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    ea = EventAccumulator(src_tb_dir)
+    ea.Reload()
+    for tag in ea.Tags().get('scalars', []):
+        for event in ea.Scalars(tag):
+            if event.step <= max_step:
+                dst_writer.add_scalar(tag, event.value, event.step, walltime=event.wall_time)
+    dst_writer.flush()
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -133,35 +145,19 @@ class NpyDepthListDataset(Dataset):
 
     Horizontal flipping is applied jointly to both the latent and depth map
     so that spatial correspondence is preserved.
+
+    NOTE: The filelist should be pre-cleaned to only contain samples that have
+    a valid _depth.npy counterpart.  Use the filelist_clean.txt generation
+    script to filter out missing / corrupt depth files before training.
     """
+
     def __init__(self, filelist_path, gather_idx, flip_p=0.5,
                  default_depth=7, num_depth_levels=8):
         with open(filelist_path, 'r') as f:
-            raw_samples = [
+            self.samples = [
                 line.strip() for line in f
                 if line.strip() and not line.strip().endswith('_depth.npy')
             ]
-        # Validate samples: filter out entries with missing/bad depth files
-        expected_len = gather_idx.shape[0] * gather_idx.shape[1]
-        valid_samples = []
-        skipped = 0
-        for path in raw_samples:
-            depth_path = path.replace('.npy', '_depth.npy')
-            if not os.path.exists(depth_path):
-                skipped += 1
-                continue
-            try:
-                d = np.load(depth_path, mmap_mode='r')
-                if d.shape[0] != expected_len:
-                    skipped += 1
-                    continue
-            except Exception:
-                skipped += 1
-                continue
-            valid_samples.append(path)
-        if skipped > 0:
-            print(f"[NpyDepthListDataset] Skipped {skipped} samples with missing/bad depth files.")
-        self.samples = valid_samples
         classes = sorted(set(
             os.path.basename(os.path.dirname(s)) for s in self.samples
         ))
@@ -198,12 +194,7 @@ class NpyDepthListDataset(Dataset):
         return x, depth_grouped, label
 
     def __getitem__(self, idx):
-        for _ in range(10):
-            try:
-                return self._load_sample(idx)
-            except Exception:
-                idx = torch.randint(len(self), (1,)).item()
-        raise RuntimeError(f"Failed to load valid sample after 10 retries (last idx={idx})")
+        return self._load_sample(idx)
 
 
 def generate_filelist(features_path, filelist_path):
@@ -325,7 +316,7 @@ def main(args):
 
     # Calculate LR and Steps:
     # 1. Linear Scaling Rule: lr = base_lr * (global_batch_size / 256)
-    base_lr = 1e-4 * (args.global_batch_size / 256)
+    base_lr = args.base_lr * (args.global_batch_size / 256)
     
     # 2. Setup Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=0)
@@ -358,13 +349,43 @@ def main(args):
             logger.warning("Warning: BF16 requested but not supported by this hardware. Performance may degrade or error.")
 
     # Variables for monitoring/logging purposes:
+    start_epoch = 0
     train_steps = 0
     log_steps = 0
     running_loss = 0
+
+    # Resume logic
+    if args.resume:
+        start_epoch, train_steps = resume_from_checkpoint(
+            args=args,
+            model=model,
+            ema=ema,
+            opt=opt,
+            device=device,
+            logger=logger,
+            steps_per_epoch=steps_per_epoch
+        )
+        # Copy old TensorBoard data (only steps <= train_steps) into the new run
+        if rank == 0 and tb_writer is not None:
+            old_experiment_dir = os.path.dirname(os.path.dirname(args.resume))  # .../checkpoints/xxx.pt -> .../
+            old_tb_dir = os.path.join(old_experiment_dir, "tensorboard")
+            if os.path.isdir(old_tb_dir):
+                logger.info(f"Copying TB events (step <= {train_steps}) from {old_tb_dir}")
+                copy_tb_events(old_tb_dir, tb_writer, max_step=train_steps)
+            else:
+                raise FileNotFoundError(f"Old TB dir not found: {old_tb_dir}")
+        # Override optimizer LR with the new base_lr (in case we want a different LR)
+        for pg in opt.param_groups:
+            pg["lr"] = base_lr
+        # Fast-forward scheduler to the resumed step
+        for _ in range(train_steps):
+            scheduler.step()
+        logger.info(f"Scheduler fast-forwarded to step {train_steps}, LR: {opt.param_groups[0]['lr']:.2e}")
+
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, depth, y in loader:
@@ -451,7 +472,7 @@ if __name__ == "__main__":
     parser.add_argument("--global-batch-size", type=int, default=1024)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema") 
-    parser.add_argument("--num-workers", type=int, default=32)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=10_000)
     parser.add_argument("--warmup-epochs", type=int, default=5, help="Number of epochs for learning rate warmup")
@@ -460,6 +481,10 @@ if __name__ == "__main__":
                         help="Number of discrete depth levels (0 disables depth conditioning)")
     parser.add_argument("--leaves-per-token", type=int, default=16,
                         help="Number of z-order leaves per DiT token")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to a checkpoint .pt file to resume training from")
+    parser.add_argument("--base-lr", type=float, default=1e-4,
+                        help="Base learning rate before batch-size scaling (default: 1e-4)")
     args = parser.parse_args()
     main(args)
 
