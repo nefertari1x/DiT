@@ -3,3 +3,6 @@ results/
 wandb/
 
 filelist.txt
+checklist.py
+CLAUDE.md
+job.sh
