@@ -9,7 +9,7 @@
     loss.backward()
     anomaly = monitor.check_after_backward(train_steps, loss.item())
     if anomaly:
-        monitor.dump_snapshot(train_steps, x, t, y, depth)
+        monitor.dump_snapshot(train_steps, x, t, y, depth_seq, depth_centers)
         # 可选：跳过这一步更新
         opt.zero_grad()
         continue
@@ -64,6 +64,7 @@ class GradientMonitor:
             base = base._orig_mod
 
         # 监控每个 DiT block
+        self._adaln_clamp_sources = []  # 记录有 clamp 的 block，用于读取 post-clamp 值
         for i, block in enumerate(base.blocks):
             name = f"block_{i}"
             self._register_one(block, name)
@@ -71,15 +72,24 @@ class GradientMonitor:
             self._register_one(block.attn, f"block_{i}.attn")
             self._register_one(block.mlp, f"block_{i}.mlp")
             self._register_one(block.adaLN_modulation, f"block_{i}.adaLN")
+            if getattr(block, 'adaln_clamp', 0) > 0:
+                self._adaln_clamp_sources.append((f"block_{i}.adaLN_clamped", block))
 
         # 监控其他关键组件
         self._register_one(base.x_embedder, "x_embedder")
         self._register_one(base.t_embedder, "t_embedder")
         self._register_one(base.y_embedder, "y_embedder")
         self._register_one(base.final_layer, "final_layer")
+        if getattr(base.final_layer, 'adaln_clamp', 0) > 0:
+            self._adaln_clamp_sources.append(("final_layer.adaLN_clamped", base.final_layer))
 
-        if hasattr(base, 'depth_embedder') and base.use_depth:
-            self._register_one(base.depth_embedder, "depth_embedder")
+        if getattr(base, 'use_depth', False):
+            self._register_one(base.depth_value_embed, "depth_value_embed")
+            self._register_one(base.depth_k_proj, "depth_k_proj")
+            self._register_one(base.depth_v_proj, "depth_v_proj")
+            for i, block in enumerate(base.blocks):
+                if getattr(block, 'use_cross', False):
+                    self._register_one(block.cross_attn, f"block_{i}.cross_attn")
 
     def _register_one(self, module, name):
         """给单个 module 注册 forward 和 backward hook。"""
@@ -122,6 +132,8 @@ class GradientMonitor:
         在 loss.backward() 之后调用。
         返回 True 表示检测到异常，建议跳过这一步。
         """
+        self._collect_post_clamp_stats()
+
         # 更新 loss 历史
         self.loss_history.append(loss_val)
 
@@ -215,7 +227,7 @@ class GradientMonitor:
                   f"mean={s['mean']:10.4f}  std={s['std']:10.4f}{flag}")
         print(f"{'='*60}\n")
 
-    def dump_snapshot(self, step, x, t, y, depth=None):
+    def dump_snapshot(self, step, x, t, y, depth_seq=None, depth_centers=None):
         """
         保存触发异常的 batch 数据，便于离线复现。
         """
@@ -227,9 +239,17 @@ class GradientMonitor:
             "x": x.detach().cpu(),
             "t": t.detach().cpu(),
             "y": y.detach().cpu(),
-            "depth": depth.detach().cpu() if depth is not None else None,
+            "depth_seq": depth_seq.detach().cpu() if depth_seq is not None else None,
+            "depth_centers": depth_centers.detach().cpu() if depth_centers is not None else None,
         }, path)
         print(f"[DEBUG] Saved anomaly batch to {path}")
+
+    def _collect_post_clamp_stats(self):
+        """读取各 block/final_layer 的 _adaln_post_clamp 属性，计算统计量。"""
+        for name, module in self._adaln_clamp_sources:
+            t = getattr(module, '_adaln_post_clamp', None)
+            if t is not None:
+                self.activation_stats[name] = self._tensor_stats(t)
 
     def log_periodic(self, step, tb_writer=None):
         """
@@ -238,6 +258,8 @@ class GradientMonitor:
         """
         if self.rank != 0:
             return
+
+        self._collect_post_clamp_stats()
 
         if tb_writer is not None:
             for name, stats in self.activation_stats.items():

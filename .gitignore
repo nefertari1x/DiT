@@ -6,5 +6,6 @@ filelist.txt
 checklist.py
 CLAUDE.md
 job.sh
+scripts/
 
 job.sh.o*

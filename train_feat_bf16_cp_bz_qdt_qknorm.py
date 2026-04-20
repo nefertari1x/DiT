@@ -168,7 +168,8 @@ def main(args):
         num_classes=args.num_classes,
         num_depth_levels=args.num_depth_levels,
         orig_image_size=args.orig_image_size,
-        adaln_clamp=args.adaln_clamp,
+        qk_norm=True,
+        t_embed_norm=True,
     )
     model = model.to(device)
     if rank == 0:
@@ -397,8 +398,6 @@ if __name__ == "__main__":
                         help="Number of discrete depth levels (0 disables depth conditioning)")
     parser.add_argument("--orig-image-size", type=int, default=256,
                         help="Original image size (pre-sqr encoding); used for leaf-center PE")
-    parser.add_argument("--adaln-clamp", type=float, default=0,
-                        help="adaLN output soft clamp via C*tanh(x/C). 0 disables (default: 0)")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to a checkpoint .pt file to resume training from")
     parser.add_argument("--base-lr", type=float, default=1e-4,
