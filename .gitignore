@@ -7,5 +7,7 @@ checklist.py
 CLAUDE.md
 job.sh
 scripts/
+.claude/
+*.png
 
 job.sh.o*
